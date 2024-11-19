@@ -1,0 +1,1000 @@
+package net.floodlightcontroller.cgrmodule;
+
+import java.util.ArrayList;
+import java.io.FileWriter; 
+import java.io.BufferedWriter;
+import java.io.PrintWriter;
+import java.io.File;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.projectfloodlight.openflow.protocol.OFFlowMod;
+import org.projectfloodlight.openflow.protocol.OFFlowModCommand;
+import org.projectfloodlight.openflow.protocol.OFFlowModFlags;
+import org.projectfloodlight.openflow.protocol.OFFlowRemoved;
+import org.projectfloodlight.openflow.protocol.OFMessage;
+import org.projectfloodlight.openflow.protocol.OFPacketIn;
+import org.projectfloodlight.openflow.protocol.OFPacketOut;
+import org.projectfloodlight.openflow.protocol.OFPortDesc;
+import org.projectfloodlight.openflow.protocol.OFType;
+import org.projectfloodlight.openflow.protocol.OFVersion;
+import org.projectfloodlight.openflow.protocol.action.OFAction;
+import org.projectfloodlight.openflow.protocol.action.OFActionOutput;
+import org.projectfloodlight.openflow.protocol.action.OFActions;
+import org.projectfloodlight.openflow.protocol.instruction.OFInstruction;
+import org.projectfloodlight.openflow.protocol.instruction.OFInstructionApplyActions;
+import org.projectfloodlight.openflow.protocol.instruction.OFInstructions;
+import org.projectfloodlight.openflow.protocol.match.Match;
+import org.projectfloodlight.openflow.protocol.match.MatchField;
+import org.projectfloodlight.openflow.types.DatapathId;
+import org.projectfloodlight.openflow.types.EthType;
+import org.projectfloodlight.openflow.types.IPv4Address;
+import org.projectfloodlight.openflow.types.IpProtocol;
+import org.projectfloodlight.openflow.types.MacAddress;
+import org.projectfloodlight.openflow.types.OFBufferId;
+import org.projectfloodlight.openflow.types.OFPort;
+import org.projectfloodlight.openflow.types.OFVlanVidMatch;
+import org.projectfloodlight.openflow.types.TableId;
+import org.projectfloodlight.openflow.types.TransportPort;
+import org.projectfloodlight.openflow.types.U64;
+import org.projectfloodlight.openflow.types.VlanVid;
+import org.projectfloodlight.openflow.util.LRULinkedHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+
+
+import ch.qos.logback.classic.db.names.TableName;
+import net.floodlightcontroller.cgrmodule.util.*;
+import net.floodlightcontroller.core.FloodlightContext;
+import net.floodlightcontroller.core.IControllerCompletionListener;
+import net.floodlightcontroller.core.IFloodlightProviderService;
+import net.floodlightcontroller.core.IOFMessageListener;
+import net.floodlightcontroller.core.IOFSwitchListener;
+import net.floodlightcontroller.core.PortChangeType;
+import net.floodlightcontroller.core.internal.IOFSwitchService;
+import net.floodlightcontroller.core.internal.TableFeatures;
+import net.floodlightcontroller.core.IOFSwitch;
+import net.floodlightcontroller.core.module.FloodlightModuleContext;
+import net.floodlightcontroller.core.module.FloodlightModuleException;
+import net.floodlightcontroller.core.module.IFloodlightModule;
+import net.floodlightcontroller.core.module.IFloodlightService;
+import net.floodlightcontroller.learningswitch.LearningSwitch;
+import net.floodlightcontroller.packet.Ethernet;
+import net.floodlightcontroller.packet.IPacket;
+import net.floodlightcontroller.packet.IPv4;
+import net.floodlightcontroller.packet.TCP;
+import net.floodlightcontroller.util.OFMessageUtils;
+
+public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwitchListener {
+	protected static Logger log = LoggerFactory.getLogger(CGRmodule.class);
+
+	// Module dependencies
+	protected IFloodlightProviderService floodlightProviderService;
+	protected IOFSwitchService switchService;
+
+	// Stores the learned state for each switch
+	protected Map<IOFSwitch, Map<MacAddress, OFPort>> macToSwitchPortMap;
+	
+	// flow-mod - for use in the cookie
+	public static final int LEARNING_SWITCH_APP_ID = 1;
+	// LOOK! This should probably go in some class that encapsulates
+	// the app cookie management
+	public static final int APP_ID_BITS = 12;
+	public static final int APP_ID_SHIFT = (64 - APP_ID_BITS);
+	public static final long LEARNING_SWITCH_COOKIE = (long) (LEARNING_SWITCH_APP_ID & ((1 << APP_ID_BITS) - 1)) << APP_ID_SHIFT;
+
+	// more flow-mod defaults
+	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 5; // in seconds
+	protected static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 0; // infinite
+	protected static short FLOWMOD_PRIORITY = 100;
+
+	// for managing our map sizes
+	protected static final int MAX_MACS_PER_SWITCH  = 1000;
+
+	// normally, setup reverse flow as well. Disable only for using cbench for comparison with NOX etc.
+	protected static final boolean LEARNING_SWITCH_REVERSE_FLOW = true;
+	
+	// Mapa com enderecos IP e array com (numero max, numero atual) de hosts.
+	protected Map<IPv4Address,int[]> numMaxHosts;
+	protected Map<IPv4Address,Map<IPv4Address,Integer>> conexoesAtuais;
+	protected Map<IPv4Address,Map<IPv4Address,Integer>>fluxosTCP;
+
+	//Inicializar ^
+	protected void inicializarEnderecosRestritos() {
+		IPv4Address sourceIP = IPv4Address.of("10.0.0.8");
+		int[] i=new int[]{1,0};
+		numMaxHosts.put(sourceIP, i);
+		
+		sourceIP = IPv4Address.of("10.0.0.6");
+		i=new int[]{2,0};
+		numMaxHosts.put(sourceIP, i);
+		
+		sourceIP = IPv4Address.of("10.0.0.4");
+		i=new int[]{3,0};
+		numMaxHosts.put(sourceIP, i);
+	}
+	
+	/**
+	 * @param floodlightProvider the floodlightProvider to set
+	 */
+	public void setFloodlightProvider(IFloodlightProviderService floodlightProviderService) {
+		this.floodlightProviderService = floodlightProviderService;
+	}
+
+	@Override
+	public String getName() {
+		return "CGRModule";
+	}
+
+	/**
+	 * Adds a host to the MAC->SwitchPort mapping
+	 * @param sw The switch to add the mapping to
+	 * @param mac The MAC address of the host to add
+	 * @param portVal The switchport that the host is on
+	 */
+	protected void addToPortMap(IOFSwitch sw, MacAddress mac, OFPort portVal) {
+		Map<MacAddress, OFPort> swMap = macToSwitchPortMap.get(sw);
+
+		if (swMap == null) {
+			swMap = new LRULinkedHashMap<MacAddress, OFPort>(MAX_MACS_PER_SWITCH);
+			macToSwitchPortMap.put(sw, swMap);
+		}
+		swMap.put(mac, portVal);
+	}
+
+	/**
+	 * Removes a host from the MAC->SwitchPort mapping
+	 * @param sw The switch to remove the mapping from
+	 * @param mac The MAC address of the host to remove
+	 */
+	protected void removeFromPortMap(IOFSwitch sw, MacAddress mac) {
+
+		Map<MacAddress, OFPort> swMap = macToSwitchPortMap.get(sw);
+		if (swMap != null) {
+			swMap.remove(mac);
+		}
+	}
+
+	/**
+	 * Get the port that a MAC is associated with
+	 * @param sw The switch to get the mapping from
+	 * @param mac The MAC address to get
+	 * @return The port the host is on
+	 */
+	public OFPort getFromPortMap(IOFSwitch sw, MacAddress mac) {
+		Map<MacAddress, OFPort> swMap = macToSwitchPortMap.get(sw);
+		if (swMap != null) {
+			return swMap.get(mac);
+		}
+
+		// if none found
+		return null;
+	}
+
+	/**
+	 * Clears the MAC -> SwitchPort map for all switches
+	 */
+	public void clearLearnedTable() {
+		macToSwitchPortMap.clear();
+	}
+
+	/**
+	 * Clears the MAC/VLAN -> SwitchPort map for a single switch
+	 * @param sw The switch to clear the mapping for
+	 */
+	public void clearLearnedTable(IOFSwitch sw) {
+		Map<MacAddress, OFPort> swMap = macToSwitchPortMap.get(sw);
+		if (swMap != null) {
+			swMap.clear();
+		}
+	}
+	
+	protected Match createMatchFromPacketLearning(IOFSwitch sw, OFPort inPort, Ethernet eth, int reverse) {
+		// The packet in match will only contain the port number.
+		// We need to add in specifics for the hosts we're routing between.
+		MacAddress srcMac = eth.getSourceMACAddress();
+		MacAddress dstMac = eth.getDestinationMACAddress();
+
+		Match.Builder mb = sw.getOFFactory().buildMatch();
+		
+		if(reverse == 0) {
+			mb.setExact(MatchField.IN_PORT, inPort)
+			.setExact(MatchField.ETH_SRC, srcMac)
+			.setExact(MatchField.ETH_DST, dstMac);
+		} else {
+			mb.setExact(MatchField.IN_PORT, inPort)
+			.setExact(MatchField.ETH_SRC, dstMac)
+			.setExact(MatchField.ETH_DST, srcMac);
+		}
+
+		return mb.build();
+	}
+	
+	protected Match createMatchFromSourceIP(IOFSwitch sw, Ethernet eth) {
+		EthType ethertype = eth.getEtherType();
+		if(ethertype == EthType.IPv4) {
+			IPv4 payloadIPv4 = (IPv4) eth.getPayload();
+			IPv4Address sourceIPv4 = payloadIPv4.getSourceAddress();
+			IPv4Address destIPv4 = payloadIPv4.getDestinationAddress();
+			Match.Builder mb = sw.getOFFactory().buildMatch();
+			
+			mb.setExact(MatchField.ETH_TYPE, ethertype)
+			  .setExact(MatchField.IPV4_SRC, sourceIPv4)
+			  .setExact(MatchField.IPV4_DST, destIPv4);
+		
+			return mb.build();
+		} else 
+			return null;
+	
+	}
+	
+	protected Match createMatchFromTCPFlux(IOFSwitch sw, Ethernet eth) {
+		EthType ethertype = eth.getEtherType();
+		if(ethertype  == EthType.IPv4) {
+			IPv4 payloadIPv4 = (IPv4) eth.getPayload();
+			IPv4Address sourceIPv4 = payloadIPv4.getSourceAddress();
+			IPv4Address destIPv4 = payloadIPv4.getDestinationAddress();
+			IpProtocol protocoloIPv4  = payloadIPv4.getProtocol();
+			
+			if(protocoloIPv4 == IpProtocol.TCP) {
+				TCP payloadTCP = (TCP) payloadIPv4.getPayload();
+				TransportPort srcPortTCP = payloadTCP.getSourcePort();
+				TransportPort dstPortTCP = payloadTCP.getDestinationPort();
+				
+				Match.Builder mb = sw.getOFFactory().buildMatch();
+				
+				mb.setExact(MatchField.ETH_TYPE, ethertype)
+				  .setExact(MatchField.IPV4_SRC, sourceIPv4)
+				  .setExact(MatchField.IPV4_DST, destIPv4)
+				  .setExact(MatchField.IP_PROTO, protocoloIPv4)
+				  .setExact(MatchField.TCP_SRC, srcPortTCP)
+				  .setExact(MatchField.TCP_DST, dstPortTCP);
+				
+				return mb.build();
+			} else {
+				return null;
+			}
+		} else {
+			return null;
+		}
+	}
+	
+	protected List<OFAction> createActionListDrop(IOFSwitch sw) {
+		//lista vazia de acoes = drop
+		List<OFAction> al = new ArrayList<OFAction>();
+		return al;
+	}
+	
+	protected List<OFAction> createActionListPacketLearning(IOFSwitch sw, OFPort outPort) {
+		OFActions actions = sw.getOFFactory().actions(); //actions builder
+		List<OFAction> al = new ArrayList<OFAction>();
+		OFActionOutput output = actions.buildOutput()
+				.setPort(outPort)    // outPort is the port trough which the sw should send the Matching Packets
+				.setMaxLen(0xffFFffFF)
+				.build();
+		al.add(output);
+		return al;
+	}
+
+	protected void adicionarRegrasProativas(IOFSwitch sw) {
+		Set<IPv4Address> lista_ips =  numMaxHosts.keySet();
+		Iterator<IPv4Address> lista_ips_iterador = lista_ips.iterator();
+		EthType ethertype = EthType.IPv4;
+		IpProtocol protocolo = IpProtocol.TCP;
+	
+		//aplicar regras de controlo de acesso ao switch
+		while(lista_ips_iterador.hasNext()) {
+			IPv4Address ip = lista_ips_iterador.next();
+			
+			Match.Builder mb = sw.getOFFactory().buildMatch();
+			mb.setExact(MatchField.ETH_TYPE, ethertype)
+			  .setExact(MatchField.IPV4_SRC, ip);
+				
+			Match match1 = mb.build();
+			List<OFAction> actionlist1 = createActionListPacketLearning(sw, OFPort.CONTROLLER);
+			
+			OFInstructions instructions1 =  sw.getOFFactory().instructions(); //instructions builder
+			OFInstructionApplyActions applyActions1 = instructions1.buildApplyActions().setActions(actionlist1).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+			ArrayList<OFInstruction> instructionListsw1 = new ArrayList<OFInstruction>(); 
+			instructionListsw1.add(applyActions1); //add the applyActions Instruction to the Instruction list
+				
+			if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+200), match1, instructionListsw1, null, 
+			    CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, (short) 0, OFBufferId.NO_BUFFER,false))) {
+					
+			} else {
+					 log.info("{} Regras default para source IP {} nao foram adicionadas com sucesso para OF 1.3", sw,ip);
+			}
+		}
+		
+		//aplicar regra para apanhar TCP nos switches (3a maior prioridade)
+		Match.Builder mb = sw.getOFFactory().buildMatch();
+		mb.setExact(MatchField.ETH_TYPE, ethertype)
+		.setExact(MatchField.IP_PROTO, protocolo);
+		
+		Match match1 = mb.build();
+		List<OFAction> actionlist1 = createActionListPacketLearning(sw, OFPort.CONTROLLER);
+		
+		OFInstructions instructions1 =  sw.getOFFactory().instructions(); //instructions builder
+		OFInstructionApplyActions applyActions1 = instructions1.buildApplyActions().setActions(actionlist1).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+		ArrayList<OFInstruction> instructionListsw1 = new ArrayList<OFInstruction>(); 
+		instructionListsw1.add(applyActions1); //add the applyActions Instruction to the Instruction list
+		
+		if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+800), match1, instructionListsw1, null, 
+			    CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, (short) 0, OFBufferId.NO_BUFFER,false))) {
+				
+		} else {
+				log.info("{} Regra default TCP nao foi adicionada com sucesso para OF 1.3", sw);
+		}
+	}
+		
+	/**
+	 * Processes a OFPacketIn message. If the switch has learned the MAC to port mapping
+	 * for the pair it will write a FlowMod for. If the mapping has not been learned the
+	 * we will flood the packet.
+	 * @param sw
+	 * @param pi
+	 * @param cntx
+	 * @return
+	 */
+	private Command processPacketInMessage(IOFSwitch sw, OFPacketIn pi, FloodlightContext cntx) {
+		//para adicionar as regras sobre fluxos e TCP antes de tudo
+		adicionarRegrasProativas(sw);
+		
+		OFPort inPort = (pi.getVersion().compareTo(OFVersion.OF_12) < 0 ? pi.getInPort() : pi.getMatch().get(MatchField.IN_PORT));
+	
+		/*Read the Packet_In Message Payload (EThernet packet) in to an Ethernet Object*/
+		Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
+		IPv4 payloadIPv4 = null;
+		IPv4Address sourceIPv4 = null;
+		IPv4Address destIPv4 = null;
+		IpProtocol protocoloIPv4 = null;
+		TCP payloadTCP = null;
+		TransportPort srcPortTCP = null;
+		TransportPort dstPortTCP = null;
+		
+		/* Read packet header attributes into a Match object */
+		EthType ethertype = eth.getEtherType();
+		if(ethertype  == EthType.IPv4) {
+			payloadIPv4 = (IPv4) eth.getPayload();
+			sourceIPv4 = payloadIPv4.getSourceAddress();
+			destIPv4 = payloadIPv4.getDestinationAddress();
+			protocoloIPv4  = payloadIPv4.getProtocol();
+			
+			if(protocoloIPv4 == IpProtocol.TCP) {
+				payloadTCP = (TCP) payloadIPv4.getPayload();
+				srcPortTCP = payloadTCP.getSourcePort();
+				dstPortTCP = payloadTCP.getDestinationPort();
+			}
+		}
+		
+		MacAddress sourceMac = eth.getSourceMACAddress();
+		MacAddress destMac = eth.getDestinationMACAddress();
+		
+		if (sourceMac == null) {
+			sourceMac = MacAddress.NONE;
+		}
+		if (destMac == null) {
+			destMac = MacAddress.NONE;
+		}
+		
+		if ((destMac.getLong() & 0xfffffffffff0L) == 0x0180c2000000L) {
+			if (log.isTraceEnabled()) {
+				log.trace("ignoring packet addressed to 802.1D/Q reserved addr: switch {} dest MAC {}",
+						new Object[]{ sw, destMac.toString() });
+			}
+			return Command.STOP;
+		}
+		if ((!sourceMac.isBroadcast())&&(!sourceMac.isMulticast())) {
+			log.info("Unicast packet received: switch {} Ethertype {}",
+					new Object[]{ sw, eth.getEtherType() });
+		  // If source MAC is a unicast address, learn the port for this MAC/VLAN
+			addToPortMap(sw,sourceMac,inPort);
+		}
+		
+		//Se e dos source IPs com numero de hosts limitado
+		if(((ethertype  == EthType.IPv4))&&numMaxHosts.containsKey(sourceIPv4)) {
+			int[]numhosts = numMaxHosts.get(sourceIPv4);
+			
+			if(!conexoesAtuais.containsKey(sourceIPv4)) {
+				Map<IPv4Address,Integer> mapaux = new HashMap<>();
+				conexoesAtuais.put(sourceIPv4, mapaux);
+			}
+			Map<IPv4Address,Integer> mapaux = conexoesAtuais.get(sourceIPv4);
+			if(!mapaux.containsKey(destIPv4))
+				mapaux.put(destIPv4, 0);
+			
+			log.info("Endereco {} e limitado, numero max de hosts = {}",sourceIPv4,numhosts[0]);
+			log.info("Endereco {} e limitado, Num atual de hosts = {}",sourceIPv4,numhosts[1]);
+			
+			boolean temTCP = false;
+			
+			//Se e o primeiro sw para este destino
+			if(mapaux.get(destIPv4) == 0) {
+				
+				if(fluxosTCP.containsKey(sourceIPv4)) {
+					Map<IPv4Address,Integer> mapauxTCP = fluxosTCP.get(sourceIPv4);
+					
+					//ha uma ligacao TCP ativa que ja incrementou as ligacoes (para passar o if em baixo)
+					if((mapauxTCP.containsKey(destIPv4)) && (mapauxTCP.get(destIPv4)==1)) {
+						temTCP = true;
+					} 
+				}
+			
+				//Se estiver em condicoes de se poder ligar a mais um destino (incluindo fluxos TCP)
+				if((numhosts[1] < numhosts[0]) || ((numhosts[1] == numhosts[0]) && temTCP)){
+					//se NAO for trafego TCP
+					if(!((ethertype  == EthType.IPv4)&&(protocoloIPv4 == IpProtocol.TCP))) {
+						//criar regra para fazer o encaminhamento unicast para o endereco 
+						if(getFromPortMap(sw,destMac) != null) {
+							Match match2 = createMatchFromSourceIP(sw, eth);
+							List<OFAction> actionlist2 = createActionListPacketLearning(sw,getFromPortMap(sw,destMac));
+							
+							if (pi.getVersion().compareTo(OFVersion.OF_13)==0){ //se for openflow 1.3 cria instruction list 
+								OFInstructions instructions2 =  sw.getOFFactory().instructions(); //instructions builder
+								OFInstructionApplyActions applyActions2 = instructions2.buildApplyActions().setActions(actionlist2).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+								ArrayList<OFInstruction> instructionListsw2 = new ArrayList<OFInstruction>(); 
+								instructionListsw2.add(applyActions2); //add the applyActions Instruction to the Instruction list
+								
+								if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+400), match2, instructionListsw2, null, 
+									CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, CGRmodule.FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER,true))) {
+										log.info("{} Regra para source IP {} foi adicionada com sucesso para OF 1.3", sw,sourceIPv4);
+								} else {
+										log.info("{} Regra para source IP {} nao foi adicionada com sucesso para OF 1.3", sw,sourceIPv4);
+								}
+							} else {
+								if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+400), match2, null, actionlist2, 
+									CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, CGRmodule.FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER,true))) {
+										log.info("{} Regra para source IP {} foi adicionada com sucesso", sw,sourceIPv4);
+								} else {
+										log.info("{}  Regra para source IP {} nao foi adicionada com sucesso", sw,sourceIPv4);
+								}
+							}
+						
+							//ja existe regra para este destino, nao criar em futuros sw
+							mapaux.put(destIPv4,1);
+							
+							// ver se existe fluxo TCP com mesmo destino antes de incrementar
+							if(fluxosTCP.containsKey(sourceIPv4)) {
+								Map<IPv4Address,Integer> mapauxTCP = fluxosTCP.get(sourceIPv4);
+								
+								//ha uma ligacao TCP ativa que ja incrementou as ligacoes
+								if((mapauxTCP.containsKey(destIPv4)) && (mapauxTCP.get(destIPv4)==1)) {
+									
+								} else {
+									numhosts[1]++;
+									numMaxHosts.put(sourceIPv4, numhosts);
+								}
+								
+							} else {
+								numhosts[1]++;
+								numMaxHosts.put(sourceIPv4, numhosts);
+							}
+							
+						//regra com hard_timeout para quando nao sabe o porto de destino 
+						//fica viva o tempo suficiente para os ARPs serem feitos e se descobrir
+						//o porto, quando acontecer, a regra de cima e instalada se ainda houver
+						//trafego
+						}  else {
+							Match match2 = createMatchFromSourceIP(sw, eth);
+							List<OFAction> actionlist2 = createActionListPacketLearning(sw,OFPort.FLOOD);
+							
+							if (pi.getVersion().compareTo(OFVersion.OF_13)==0){ //se for openflow 1.3 cria instruction list 
+								OFInstructions instructions2 =  sw.getOFFactory().instructions(); //instructions builder
+								OFInstructionApplyActions applyActions2 = instructions2.buildApplyActions().setActions(actionlist2).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+								ArrayList<OFInstruction> instructionListsw2 = new ArrayList<OFInstruction>(); 
+								instructionListsw2.add(applyActions2); //add the applyActions Instruction to the Instruction list
+								
+								if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+400), match2, instructionListsw2, null, 
+									(short) 3, (short) 0, OFBufferId.NO_BUFFER,true))) {
+										log.info("{} Regra para source IP {} foi adicionada com sucesso para OF 1.3", sw,sourceIPv4);
+								} else {
+										log.info("{} Regra para source IP {} nao foi adicionada com sucesso para OF 1.3", sw,sourceIPv4);
+								}
+							} else {
+								if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+400), match2, null, actionlist2, 
+									(short) 3, (short) 0, OFBufferId.NO_BUFFER,true))) {
+										log.info("{} Regra para source IP {} foi adicionada com sucesso", sw,sourceIPv4);
+								} else {
+										log.info("{}  Regra para source IP {} nao foi adicionada com sucesso", sw,sourceIPv4);
+								}
+							}
+						
+							//ja existe regra para este destino, nao criar em futuros sw
+							mapaux.put(destIPv4,1);
+							
+							// ver se existe fluxo TCP com mesmo destino antes de incrementar
+							if(fluxosTCP.containsKey(sourceIPv4)) {
+								Map<IPv4Address,Integer> mapauxTCP = fluxosTCP.get(sourceIPv4);
+								
+								//ha uma ligacao TCP ativa que ja incrementou as ligacoes
+								if((mapauxTCP.containsKey(destIPv4)) && (mapauxTCP.get(destIPv4)==1)) {
+									
+								} else {
+									numhosts[1]++;
+									numMaxHosts.put(sourceIPv4, numhosts);
+								}
+								
+							} else {
+								numhosts[1]++;
+								numMaxHosts.put(sourceIPv4, numhosts);
+							}				
+						}
+					} 
+				//quando nao se pode ligar
+				} else {
+					//criar regra para dar drop (com prioridade maior que todos)
+					Match matchdrop = createMatchFromSourceIP(sw,eth);
+					List<OFAction> actionlistdrop = createActionListDrop(sw);
+				 
+					if (pi.getVersion().compareTo(OFVersion.OF_13)==0){ //se for openflow 1.3 cria instruction list 
+						OFInstructions instructionsdrop =  sw.getOFFactory().instructions(); //instructions builder
+						OFInstructionApplyActions applyActionsdrop = instructionsdrop.buildApplyActions().setActions(actionlistdrop).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+						ArrayList<OFInstruction> instructionListdrop = new ArrayList<OFInstruction>(); 
+						instructionListdrop.add(applyActionsdrop); //add the applyActions Instruction to the Instruction list
+					
+						//hard_timeout usado pois idle poderia levar a um deadlock
+						//quando expira se estiver ocupado a mesma ira ser colocada de novo
+						//pouco ineficiente pois um pacote a cada 6 segundos no maximo
+						//ira tratar de renovar esta regra
+						if((SwitchCommands.installRule(sw, TableId.of(0), (short)((CGRmodule.FLOWMOD_PRIORITY)+2000), matchdrop, instructionListdrop, null, 
+				           (short) 6, (short) 0, OFBufferId.NO_BUFFER,true))) {
+								log.info("{} Regra de drop para o destino {} foi adicionada com sucesso para OF 1.3", sw, sourceIPv4);
+						} else {
+								log.info("{} Regra de drop o destino {} nao foi adicionada com sucesso para OF 1.3", sw, sourceIPv4);
+						}
+					
+					} else {
+					 
+						if((SwitchCommands.installRule(sw, TableId.of(0), (short)((CGRmodule.FLOWMOD_PRIORITY)+2000), matchdrop, null, actionlistdrop, 
+								(short) 6, (short) 0 , OFBufferId.NO_BUFFER,true))) {
+						 		log.info("{} Regra de drop para o destino {} foi adicionada com sucesso", sw, sourceIPv4);
+						} else {
+								log.info("{} Regra de drop o destino {} nao foi adicionada com sucesso", sw, sourceIPv4);
+						}
+					}
+				 
+				 return Command.STOP;
+				}
+			}
+		}
+		
+		//quando chegou trafego TCP
+		//se ha limitacao de hosts E chegou aqui quer dizer que
+		//pode admitir o fluxo TCP. Caso nao teria sido instalada
+		//a regra de drop e nao se chegava aqui
+		//So chega aqui quando e possivel instalar o fluxo
+		if((ethertype  == EthType.IPv4)&&(protocoloIPv4 == IpProtocol.TCP)){
+			
+			//veificar se o fluxo ja foi registado (para nao adicionar regras repetidas)
+			if(!fluxosTCP.containsKey(sourceIPv4)) {
+				Map<IPv4Address,Integer> mapauxTCP = new HashMap<>();
+				fluxosTCP.put(sourceIPv4, mapauxTCP);
+			}
+			Map<IPv4Address,Integer> mapauxTCP = fluxosTCP.get(sourceIPv4);
+			if(!mapauxTCP.containsKey(destIPv4))
+				mapauxTCP.put(destIPv4, 0);
+			
+			
+			//caso seja o primeiro switch a encontrar este fluxo
+			if(mapauxTCP.get(destIPv4)== 0) {
+				//caso ja se saiba o port de destino
+				if(getFromPortMap(sw,destMac) != null) {
+					//juntar regra para o fluxo recebido (2a maior prioridade)
+					Match matchTCP =  createMatchFromTCPFlux(sw, eth);
+					List<OFAction> actionlistTCP = createActionListPacketLearning(sw,getFromPortMap(sw,destMac));
+					
+					if (pi.getVersion().compareTo(OFVersion.OF_13)==0){ //se for openflow 1.3 cria instruction list 
+						OFInstructions instructionsTCP =  sw.getOFFactory().instructions(); //instructions builder
+						OFInstructionApplyActions applyActionsTCP = instructionsTCP.buildApplyActions().setActions(actionlistTCP).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+						ArrayList<OFInstruction> instructionListTCP = new ArrayList<OFInstruction>(); 
+						instructionListTCP.add(applyActionsTCP); //add the applyActions Instruction to the Instruction list
+						
+						if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+1200), matchTCP, instructionListTCP, null, 
+							CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, (short) 2, OFBufferId.NO_BUFFER,true))) {
+								log.info("{} Regra para o seguinte fluxo TCP foi adicionada com sucesso para OF 1.3:", sw);
+								log.info("{} IP Source: {}", sw,sourceIPv4);
+								log.info("{} Port Source: {}", sw,srcPortTCP);
+								log.info("{} IP Dest: {}", sw,destIPv4);
+								log.info("{} Port Dest: {}", sw,dstPortTCP);
+						} else {
+								log.info("{} Regra para fluxo TCP nao foi adicionada com sucesso para OF 1.3", sw);
+						}
+					} else {
+						if((SwitchCommands.installRule(sw, TableId.of(0), (short)(CGRmodule.FLOWMOD_PRIORITY+1200), matchTCP, null, actionlistTCP, 
+							CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, (short) 2, OFBufferId.NO_BUFFER,true))) {
+							log.info("{} Regra para o seguinte fluxo TCP foi adicionada com sucesso:", sw);
+							log.info("{} IP Source: {}", sw,sourceIPv4);
+							log.info("{} Port Source: {}", sw,srcPortTCP);
+							log.info("{} IP Dest: {}", sw,destIPv4);
+							log.info("{} Port Dest: {}", sw,dstPortTCP);
+						} else {
+								log.info("{}  Regra para fluxo TCP nao foi adicionada com sucesso", sw);
+						}
+					}
+					
+					mapauxTCP.put(destIPv4,1);
+					
+					//Se e dos source IPs com numero de hosts limitado
+					if(numMaxHosts.containsKey(sourceIPv4)) {
+						int[]numhosts = numMaxHosts.get(sourceIPv4);
+						
+						// ver se existe fluxo IP ja com mesmo destino antes de incrementar
+						if(conexoesAtuais.containsKey(sourceIPv4)) {
+							Map<IPv4Address,Integer> mapaux = conexoesAtuais.get(sourceIPv4);
+							
+							//ha uma ligacao IP ativa que ja incrementou as ligacoes
+							if((mapaux.containsKey(destIPv4)) && (mapaux.get(destIPv4)==1)) {
+								
+							} else {
+								numhosts[1]++;
+								numMaxHosts.put(sourceIPv4, numhosts);
+							}
+							
+						} else {
+							numhosts[1]++;
+							numMaxHosts.put(sourceIPv4, numhosts);
+						}
+					}
+				} else {
+					//nao juntar regra para fluxo TCP enquanto nao se sabe o endereco MAC de 
+					//destino. Perdem-se bytes e duracao desta maneira mas e muito ineficiente
+					//para a rede suportar fluxos TCP inteiros a fazer flood
+				}
+			}
+		}
+		
+		//check if port for destination MAC is known
+		if(getFromPortMap(sw,destMac) != null) {
+			// If so output flow-mod and/or packet
+			
+			Match matchsw = createMatchFromPacketLearning(sw, inPort, eth, 0);
+			Match matchswrev = createMatchFromPacketLearning(sw, getFromPortMap(sw,destMac), eth, 1);
+			
+			List<OFAction> actionlistsw = createActionListPacketLearning(sw,getFromPortMap(sw,destMac));
+			List<OFAction> actionlistswrev = createActionListPacketLearning(sw, inPort);
+			
+			if (pi.getVersion().compareTo(OFVersion.OF_13)==0){ //se for openflow 1.3 cria instruction list 
+				
+				OFInstructions instructions =  sw.getOFFactory().instructions(); //instructions builder
+				OFInstructionApplyActions applyActions = instructions.buildApplyActions().setActions(actionlistsw).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+				ArrayList<OFInstruction> instructionListsw = new ArrayList<OFInstruction>(); 
+				instructionListsw.add(applyActions); //add the applyActions Instruction to the Instruction list
+				
+				OFInstructions instructionsrev =  sw.getOFFactory().instructions(); //instructions builder
+				OFInstructionApplyActions applyActionsrev = instructionsrev.buildApplyActions().setActions(actionlistswrev).build(); //use the instructions builder to build an applyActions instruction with the given action list. 
+				ArrayList<OFInstruction> instructionListswrev = new ArrayList<OFInstruction>(); 
+				instructionListswrev.add(applyActionsrev); //add the applyActions reversed Instruction to the Instruction list
+				
+				if((SwitchCommands.installRule(sw, TableId.of(0), CGRmodule.FLOWMOD_PRIORITY, matchsw, instructionListsw, null, 
+		            CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, CGRmodule.FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER,true)) && 
+				   (SwitchCommands.installRule(sw, TableId.of(0), CGRmodule.FLOWMOD_PRIORITY, matchswrev, instructionListswrev, null, 
+        	        CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, CGRmodule.FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER,true))) {
+					log.info("{} Regras MAC Learning foram adicionadas com sucesso para OF 1.3", sw);
+				} else {
+					log.info("{} Regras MAC Learning nao foram adicionadas com sucesso para OF 1.3", sw);
+				}
+			} else {
+				
+				if((SwitchCommands.installRule(sw, TableId.of(0), CGRmodule.FLOWMOD_PRIORITY, matchsw, null, actionlistsw, 
+		            CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, CGRmodule.FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER,true)) && 
+				   (SwitchCommands.installRule(sw, TableId.of(0), CGRmodule.FLOWMOD_PRIORITY, matchswrev, null, actionlistswrev, 
+				    CGRmodule.FLOWMOD_DEFAULT_HARD_TIMEOUT, CGRmodule.FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER,true))) {
+					log.info("{} Regras MAC Learning foram adicionadas com sucesso", sw);
+				} else {
+					log.info("{} Regras MAC Learning nao foram adicionadas com sucesso", sw);
+				}
+			}
+			
+			SwitchCommands.sendPacketOutPacketIn(sw, getFromPortMap(sw,destMac), pi);
+	
+		} else { //quando nao se sabe destino
+			SwitchCommands.sendPacketOutPacketIn(sw, OFPort.FLOOD, pi);
+		}
+		
+		return Command.STOP;
+	}
+
+	/**
+	 * Processes a flow removed message. 
+	 * @param sw The switch that sent the flow removed message.
+	 * @param flowRemovedMessage The flow removed message.
+	 * @return Whether to continue processing this message or stop.
+	 */
+	private Command processFlowRemovedMessage(IOFSwitch sw, OFFlowRemoved flowRemovedMessage) {
+		if (log.isTraceEnabled()) {
+			log.trace("{} flow entry removed {}", sw, flowRemovedMessage);
+		}
+		log.info("{} flow entry removed {}", sw, flowRemovedMessage);
+		Match match = flowRemovedMessage.getMatch();
+	
+		EthType ethertype = match.get(MatchField.ETH_TYPE);
+		OFPort inPort = match.get(MatchField.IN_PORT);
+		MacAddress srcMac = match.get(MatchField.ETH_SRC);
+		MacAddress dstMac = match.get(MatchField.ETH_DST);
+		IPv4Address sourceIPv4 = match.get(MatchField.IPV4_SRC);
+		IPv4Address destIPv4 = match.get(MatchField.IPV4_DST);
+		IpProtocol protocol = match.get(MatchField.IP_PROTO);
+		TransportPort srcPortTCP =match.get(MatchField.TCP_SRC);
+		TransportPort dstPortTCP =match.get(MatchField.TCP_DST);
+		
+		
+		int matchpriority = flowRemovedMessage.getPriority();
+		
+		//se foi uma regra de MAC learning que expirou
+		if((inPort != null)&& (srcMac != null)&&(dstMac != null)) {
+			if(getFromPortMap(sw,srcMac) != null) {
+				removeFromPortMap(sw, srcMac);
+				log.info("{} o MAC {} foi removido do PortMap", sw, srcMac);
+			} else {
+				log.info("{} Nao existe {} no PortMap", sw, srcMac);
+			}
+
+			Match.Builder mb = sw.getOFFactory().buildMatch();
+			mb.setExact(MatchField.IN_PORT, inPort)
+			.setExact(MatchField.ETH_SRC, dstMac)
+			.setExact(MatchField.ETH_DST, srcMac);
+			
+			if(SwitchCommands.removeRules(sw, TableId.of(0), mb.build())) {
+				log.info("{} a regra inversa foi removida do switch", sw);
+			} else {
+				log.info("{} nao foi possivel remover a regra inversa", sw);
+			}
+		}
+		
+		//se foi uma regra de controlo de fluxo que expirou
+		if((sourceIPv4 != null) && (destIPv4 != null) && (ethertype == EthType.IPv4) && (matchpriority<600)) {
+			 int[] numhosts = numMaxHosts.get(sourceIPv4);
+			 Map<IPv4Address,Integer> mapaux = conexoesAtuais.get(sourceIPv4);
+			 mapaux.remove(destIPv4);
+			 
+			 //verificar se existe mais fluxos (TCP) para o destino
+			 //caso sim NAO decrementar pois o destino tem fluxos
+			 //caso nao decrementar, era o ultimo fluxo
+			 if(fluxosTCP.containsKey(sourceIPv4)) {
+					Map<IPv4Address,Integer> mapauxTCP = fluxosTCP.get(sourceIPv4);
+					
+					//ha uma ligacao TCP ativa que ja incrementou as ligacoes
+					if((mapauxTCP.containsKey(destIPv4)) && (mapauxTCP.get(destIPv4)==1)) {
+						
+					} else {
+						 numhosts[1]--;
+						 numMaxHosts.put(sourceIPv4, numhosts);
+					}
+					
+				} else {
+					 numhosts[1]--;
+					 numMaxHosts.put(sourceIPv4, numhosts);
+				}
+			
+			 log.info("{} um fluxo de source address {} expirou", sw,sourceIPv4);
+			 log.info("{} numero de destinos que ainda estao ativos = {}", sw,numhosts[1]);
+		}
+		
+		//se foi uma regra de controlo de fluxo TCP que expirou
+		if((protocol == IpProtocol.TCP) && (srcPortTCP != null) && (dstPortTCP != null)) {
+			long bytes = (flowRemovedMessage.getByteCount()).getValue();
+			long duracao = (flowRemovedMessage.getDurationSec());
+			
+			try (FileWriter fw = new FileWriter("/home/pfa/Desktop/TCP.txt",true); 
+				 BufferedWriter bw = new BufferedWriter(fw);
+				 PrintWriter pw = new PrintWriter(bw);){
+				pw.print('(');
+				pw.print(sourceIPv4.toString());
+				pw.print(';');
+				pw.print(destIPv4.toString());
+				pw.print(';');
+				pw.print(srcPortTCP.toString());
+				pw.print(';');
+				pw.print(dstPortTCP.toString());
+				pw.print("),(");
+				pw.print(bytes);
+				pw.print(';');
+				pw.print(duracao);
+				pw.println(")");
+				
+				log.info("{} fluxo TCP expirou, os resultados foram escritos em TCP.txt", sw);
+				
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			
+			//ja e possivel juntar outro fluxo 
+			Map<IPv4Address,Integer> mapauxTCP = fluxosTCP.get(sourceIPv4);
+			mapauxTCP.remove(destIPv4);
+			 
+			//Se e dos source IPs com numero de hosts limitado
+			if(numMaxHosts.containsKey(sourceIPv4)) {
+				int[]numhosts = numMaxHosts.get(sourceIPv4);
+					
+				// ver se existe fluxo IP ja com mesmo destino antes de decrementar
+				if(conexoesAtuais.containsKey(sourceIPv4)) {
+					Map<IPv4Address,Integer> mapaux = conexoesAtuais.get(sourceIPv4);
+						
+					//ha uma ligacao IP ativa que ja incrementou as ligacoes
+					if((mapaux.containsKey(destIPv4)) && (mapaux.get(destIPv4)==1)) {
+						
+					} else {
+						numhosts[1]--;
+						numMaxHosts.put(sourceIPv4, numhosts);
+					}
+						
+				} else {
+					numhosts[1]--;
+					numMaxHosts.put(sourceIPv4, numhosts);
+				}
+				
+				log.info("{} um fluxo de source address {} expirou", sw,sourceIPv4);
+				log.info("{} numero de destinos que ainda estao ativos = {}", sw,numhosts[1]);
+			}
+		}
+		
+		return Command.CONTINUE;
+	}
+
+	// IOFMessageListener
+
+	@Override
+	public Command receive(IOFSwitch sw, OFMessage msg, FloodlightContext cntx) {
+		switch (msg.getType()) {
+		case PACKET_IN:
+			return this.processPacketInMessage(sw, (OFPacketIn) msg, cntx);
+		case FLOW_REMOVED:
+			return this.processFlowRemovedMessage(sw, (OFFlowRemoved) msg);
+		case ERROR:
+			log.info("received an error {} from switch {}", msg, sw);
+			return Command.CONTINUE;
+		default:
+			log.error("received an unexpected message {} from switch {}", msg, sw);
+			return Command.CONTINUE;
+		}
+	}
+
+	@Override
+	public boolean isCallbackOrderingPrereq(OFType type, String name) {
+		return false;
+	}
+
+	@Override
+	public boolean isCallbackOrderingPostreq(OFType type, String name) {
+		return (type.equals(OFType.PACKET_IN) && name.equals("forwarding")) ;
+	}
+	
+	// IFloodlightModule
+
+    /**
+     * Tell the module system which services we provide.
+     */
+	@Override
+	public Collection<Class<? extends IFloodlightService>> getModuleServices() 
+	{ return null; }
+
+	/**
+     * Tell the module system which services we implement.
+     */
+	@Override
+	public Map<Class<? extends IFloodlightService>, IFloodlightService> 
+			getServiceImpls() 
+	{ return null; }
+
+	@Override
+	public Collection<Class<? extends IFloodlightService>> getModuleDependencies() {
+		Collection<Class<? extends IFloodlightService>> l =
+				new ArrayList<Class<? extends IFloodlightService>>();
+		l.add(IFloodlightProviderService.class);
+		return l;
+	}
+
+	@Override
+	public void init(FloodlightModuleContext context) throws FloodlightModuleException {
+		macToSwitchPortMap = new ConcurrentHashMap<IOFSwitch, Map<MacAddress, OFPort>>();
+		numMaxHosts = new ConcurrentHashMap<IPv4Address,int[]>();
+		conexoesAtuais = new ConcurrentHashMap<IPv4Address,Map<IPv4Address,Integer>>();
+		fluxosTCP = new ConcurrentHashMap<IPv4Address,Map<IPv4Address,Integer>>();
+		inicializarEnderecosRestritos();
+		floodlightProviderService = context.getServiceImpl(IFloodlightProviderService.class);
+		this.switchService = context.getServiceImpl(IOFSwitchService.class);
+		
+		File ficheiroTCP = new File ("/home/pfa/Desktop/TCP.txt");
+		try {
+			if(ficheiroTCP.createNewFile())
+				log.info("Ficheiro para dados TCP criado com sucesso");
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			log.info("Erro a criar ficheiro para dados TCP");
+			e.printStackTrace();
+		}
+		log.info("CGR module started {}");
+	}
+
+	@Override
+	public void startUp(FloodlightModuleContext context) {
+		// paag: register the IControllerCompletionListener
+		floodlightProviderService.addOFMessageListener(OFType.PACKET_IN, this);
+		floodlightProviderService.addOFMessageListener(OFType.FLOW_REMOVED, this);
+		floodlightProviderService.addOFMessageListener(OFType.ERROR, this);
+		switchService.addOFSwitchListener(this);
+
+		// read our config options
+		Map<String, String> configOptions = context.getConfigParams(this);
+		try {
+			String idleTimeout = configOptions.get("idletimeout");
+			if (idleTimeout != null) {
+				FLOWMOD_DEFAULT_IDLE_TIMEOUT = Short.parseShort(idleTimeout);
+			}
+		} catch (NumberFormatException e) {
+			log.warn("Error parsing flow idle timeout, " +
+					"using default of {} seconds", FLOWMOD_DEFAULT_IDLE_TIMEOUT);
+		}
+		try {
+			String hardTimeout = configOptions.get("hardtimeout");
+			if (hardTimeout != null) {
+				FLOWMOD_DEFAULT_HARD_TIMEOUT = Short.parseShort(hardTimeout);
+			}
+		} catch (NumberFormatException e) {
+			log.warn("Error parsing flow hard timeout, " +
+					"using default of {} seconds", FLOWMOD_DEFAULT_HARD_TIMEOUT);
+		}
+		try {
+			String priority = configOptions.get("priority");
+			if (priority != null) {
+				FLOWMOD_PRIORITY = Short.parseShort(priority);
+			}
+		} catch (NumberFormatException e) {
+			log.warn("Error parsing flow priority, " +
+					"using default of {}",
+					FLOWMOD_PRIORITY);
+		}
+		log.debug("FlowMod idle timeout set to {} seconds", FLOWMOD_DEFAULT_IDLE_TIMEOUT);
+		log.debug("FlowMod hard timeout set to {} seconds", FLOWMOD_DEFAULT_HARD_TIMEOUT);
+		log.debug("FlowMod priority set to {}", FLOWMOD_PRIORITY);
+	}
+
+	@Override
+	public void switchAdded(DatapathId switchId) {
+		// TODO Auto-generated method stub
+		
+	}
+
+	@Override
+	public void switchRemoved(DatapathId switchId) {
+		// TODO Auto-generated method stub
+		
+	}
+
+	@Override
+	public void switchActivated(DatapathId switchId) {
+		// TODO Auto-generated method stub
+		/// Initial FlowMod rules can be installed here upon switch activation.
+		
+	}
+
+	@Override
+	public void switchPortChanged(DatapathId switchId, OFPortDesc port, PortChangeType type) {
+		// TODO Auto-generated method stub
+		
+	}
+
+	@Override
+	public void switchChanged(DatapathId switchId) {
+		// TODO Auto-generated method stub
+		
+	}
+
+	@Override
+	public void switchDeactivated(DatapathId switchId) {
+		// TODO Auto-generated method stub
+		
+	}
+
+}
+
