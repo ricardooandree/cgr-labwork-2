@@ -62,6 +62,7 @@ import net.floodlightcontroller.core.module.IFloodlightService;
 import net.floodlightcontroller.learningswitch.LearningSwitch;
 import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.IPv4;
+import net.floodlightcontroller.packet.TCP;
 import net.floodlightcontroller.util.OFMessageUtils;
 
 public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwitchListener {
@@ -74,18 +75,13 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 	// Stores the learned state for each switch
 	protected Map<IOFSwitch, Map<MacAddress, OFPort>> macToSwitchPortMap;
 
-	protected Map<IOFswitch, Map<MacAddress, Map<Integer>> hostMaxConnectionsMap;
+	protected Map<IOFSwitch, Map<MacAddress, Integer>> hostConnectionsMap;  // key = host MAC Address / value = number of active connections
+	protected Map<MacAddress, Integer> hostMaxConnectionsMap;				// key = host MAC Address / value = host connections limit
 
-	// ESTE HASHMAP TEM O MACADDRESS E O PORTO E É NESTE QUE SE VE SE JA TEM O ORIGEM E O DESTINO
 
-	// FIXME: Maps that define host connections
-	protected Map<MacAddress, Integer> hostMaxConnectionsMap;				// Maps limited-connection hosts 
-	protected Map<MacAddress, Set<MacAddress>> hostConnectionsMap;			// Maps host connections
 	protected Map<MacAddress, Set<MacAddress>> tcpHostConnectionsMap;		// Maps host TCP connections
 	private FileWriter tcpFlowStatsWriter;									// File writer object
 	
-	// hashmap guardar mac address de origem 
-
 	// flow-mod - for use in the cookie
 	public static final int LEARNING_SWITCH_APP_ID = 1;
 
@@ -96,8 +92,8 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 	public static final long LEARNING_SWITCH_COOKIE = (long) (LEARNING_SWITCH_APP_ID & ((1 << APP_ID_BITS) - 1)) << APP_ID_SHIFT;
 
 	// more flow-mod defaults
-	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 30;   // in seconds -- quando um switch nao recebe pacotes que ativem a regra durante x tempo faz timeout
-	protected static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 300;  // ao fim deste tempo faz hard timeout/drop da regra
+	protected static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 5;   // in seconds -- quando um switch nao recebe pacotes que ativem a regra durante x tempo faz timeout
+	protected static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 0;  // infinito - ao fim deste tempo faz hard timeout/drop da regra
 	protected static short FLOWMOD_PRIORITY = 100;
 
 	// for managing our map sizes
@@ -107,81 +103,123 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 	protected static final boolean LEARNING_SWITCH_REVERSE_FLOW = true;
 	
 	// Checks if a specific host has connection limitations
-	private boolean isConnectionLimited(IPv4Address hostIp){
-		log.info("Host {} has simultaneous connections limitations", hostIp);
-		return hostMaxConnectionsMap.containsKey(hostIp);
+	private boolean isConnectionLimited(MacAddress hostMac){
+		return hostMaxConnectionsMap.containsKey(hostMac);
 	}
 
 	// Checks if a host can connect to another
-	private boolean canConnect(IPv4Address srcIp, IPv4Address dstIp){
-		Set<IPv4Address> connections = hostConnectionsMap.get(srcIp);
-		Integer maxConnections = hostMaxConnectionsMap.get(srcIp);
+	private boolean canConnect(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac){
+		Map<MacAddress, Integer> macToConnectionsMap = hostConnectionsMap.get(sw);
 
-		// Can connect if the number of active connections is less than the max allowed connections or if it already has a connection to that destination IP
-		return connections.size() < maxConnections || connections.contains(dstIp);
+		// Source - number of active connections and connections limit 
+		Integer srcConnectionsNumber = macToConnectionsMap.get(srcMac);
+		Integer srcConnectionsLimit = hostMaxConnectionsMap.get(srcMac);		
+
+		// Destination - number of active connections and connections limit 
+		Integer dstConnectionsNumber = macToConnectionsMap.get(dstMac);
+		Integer dstConnectionsLimit = hostMaxConnectionsMap.get(dstMac);		
+
+		return srcConnectionsNumber < srcConnectionsLimit && dstConnectionsNumber < dstConnectionsLimit;
 	}
 
 	// Adds a new entry to the host connections map
-	private void addToConnectionsMap(IPv4Address srcIp, IPv4Address dstIp){
-		hostConnectionsMap.computeIfAbsent(srcIp, k -> new HashSet<>()).add(dstIp);
+	private void addToHostConnectionsMap(IOFSwitch sw, MacAddress srcMac){
+		Map<MacAddress, Integer> hostConnectionsMapValue = hostConnectionsMap.computeIfAbsent(sw, k -> new HashMap<>());
+		hostConnectionsMapValue.put(srcMac, hostConnectionsMapValue.getOrDefault(srcMac, 0) + 1);
 	}
 
-	// Removes an entry from the host connections map
-	private void removeFromConnectionsMap(IPv4Address srcIp, IPv4Address dstIp) {
-        Set<IPv4Address> connections = hostConnectionsMap.getOrDefault(srcIp, new HashSet<>());
-        connections.remove(dstIp);
-    }
-
-	// Adds a new entry to the TCP host connections map
-	private void addToTcpConnectionsMap(IPv4Address srcIp, IPv4Address dstIp){
-		tcpHostConnectionsMap.computeIfAbsent(srcIp, k -> new HashSet<>()).add(dstIp);
-	}
-
-	// Removes an entry from the TCP host connections map
-	private void removeFromTcpConnectionsMap(IPv4Address srcIp, IPv4Address dstIp) {
-        Set<IPv4Address> tcpConnections = tcpHostConnectionsMap.getOrDefault(srcIp, new HashSet<>());
-        tcpConnections.remove(dstIp);
-    }
-
-	private void installDropRule(IOFSwitch sw, IPv4Address srcIp, IPv4Address dstIp) {
+	private void installDropRule(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac) {
         Match match = sw.getOFFactory().buildMatch()
-                .setExact(MatchField.IPV4_SRC, srcIp)
-                .setExact(MatchField.IPV4_DST, dstIp)
-                .build();
-				// lista de açoes vazia mas o apply actions é criado
-        SwitchCommands.installRule(sw, TableId.of(0), (short) (FLOWMOD_PRIORITY + 1000), match, 
-                                   null, Collections.emptyList(), FLOWMOD_DEFAULT_HARD_TIMEOUT,
-                                   FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER, true);
-    }
-
-    private void installFlow(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac, OFPort inPort, OFPort outPort) {
-        Match match = sw.getOFFactory().buildMatch()
-                .setExact(MatchField.IN_PORT, inPort)
                 .setExact(MatchField.ETH_SRC, srcMac)
                 .setExact(MatchField.ETH_DST, dstMac)
                 .build();
 
-        List<OFAction> actions = Arrays.asList(
-                sw.getOFFactory().actions().buildOutput().setPort(outPort).setMaxLen(Integer.MAX_VALUE).build()
-        );
+		List<OFAction> actions = Collections.emptyList();
+		OFInstructions instructions = sw.getOFFactory().instructions();
 
-        SwitchCommands.installRule(sw, TableId.of(0), FLOWMOD_PRIORITY, match, null, actions, 
-                                   FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER, true);
+        OFInstructionApplyActions applyActions = instructions.buildApplyActions()
+			.setActions(actions) // Empty actions = drop
+			.build();
+
+        List<OFInstruction> instructionList = new ArrayList<>();
+        instructionList.add(applyActions);
+
+        // Install drop rule
+        boolean ruleCheck = SwitchCommands.installRule(sw, TableId.of(0), (short) FLOWMOD_PRIORITY, 
+                                   match, instructionList, null, 
+                                   FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT, 
+                                   OFBufferId.NO_BUFFER, true);
+
+		
+		if (ruleCheck){
+			log.info("DROP RULE INSTALLED");
+		}
+    }
+
+    private void installFlow(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac, OFPort inPort, OFPort outPort) {
+        Match match = sw.getOFFactory().buildMatch()
+            .setExact(MatchField.IN_PORT, inPort)    
+            .setExact(MatchField.ETH_SRC, srcMac)    
+            .setExact(MatchField.ETH_DST, dstMac)    
+            .build();
+
+		// Creates action to forward packet
+		OFActionOutput outputAction = sw.getOFFactory().actions().buildOutput()
+			.setPort(outPort)                       // Sets the destination port to the outport 
+			.setMaxLen(Integer.MAX_VALUE)           // Packet max value
+			.build();
+
+		List<OFAction> actions = new ArrayList<>();
+		actions.add(outputAction);
+
+		OFInstructionApplyActions applyActions = sw.getOFFactory().instructions().buildApplyActions()
+			.setActions(actions)
+			.build();
+
+        List<OFInstruction> instructions = new ArrayList<>();
+        instructions.add(applyActions);
+
+        boolean ruleCheck = SwitchCommands.installRule(sw, TableId.of(0), (short) FLOWMOD_PRIORITY, 
+                                   match, instructions, null,      
+                                   FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT,                        
+                                   OFBufferId.NO_BUFFER, true);    
+		
+		if (ruleCheck){
+			log.info("FLOW RULE (FORWARD) INSTALLED");
+		}
     }
 
     private void installReverseFlow(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac, OFPort inPort, OFPort outPort) {
         Match match = sw.getOFFactory().buildMatch()
-                .setExact(MatchField.IN_PORT, outPort)
-                .setExact(MatchField.ETH_SRC, dstMac)
-                .setExact(MatchField.ETH_DST, srcMac)
-                .build();
+            .setExact(MatchField.IN_PORT, outPort)    
+            .setExact(MatchField.ETH_SRC, dstMac)    
+            .setExact(MatchField.ETH_DST, srcMac)    
+            .build();
 
-        List<OFAction> actions = Arrays.asList(
-                sw.getOFFactory().actions().buildOutput().setPort(inPort).setMaxLen(Integer.MAX_VALUE).build()
-        );
+		// Creates action to forward packet
+		OFActionOutput outputAction = sw.getOFFactory().actions().buildOutput()
+			.setPort(inPort)                       // Sets the destination port to the outport 
+			.setMaxLen(Integer.MAX_VALUE)           // Packet max value
+			.build();
 
-        SwitchCommands.installRule(sw, TableId.of(0), FLOWMOD_PRIORITY, match, null, actions, 
-                                   FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER, true);
+		List<OFAction> actions = new ArrayList<>();
+		actions.add(outputAction);
+
+		OFInstructionApplyActions applyActions = sw.getOFFactory().instructions().buildApplyActions()
+			.setActions(actions)
+			.build();
+
+        List<OFInstruction> instructions = new ArrayList<>();
+        instructions.add(applyActions);
+
+        boolean ruleCheck = SwitchCommands.installRule(sw, TableId.of(0), (short) FLOWMOD_PRIORITY, 
+                                   match, instructions, null,      
+                                   FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT,                        
+                                   OFBufferId.NO_BUFFER, true);    
+		
+		if (ruleCheck){
+			log.info("FLOW REVERSE RULE (FORWARD) INSTALLED");
+		}
     }
 
     private void installTcpFlowRule(IOFSwitch sw, IPv4Address srcIp, IPv4Address dstIp, TransportPort srcPort, TransportPort dstPort) {
@@ -228,7 +266,7 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 		return "CGRModule";
 	}
 
-	/**
+	/*
 	 * Adds a host to the MAC->SwitchPort mapping
 	 * @param sw The switch to add the mapping to
 	 * @param mac The MAC address of the host to add
@@ -321,55 +359,55 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 		MacAddress srcMac = eth.getSourceMACAddress();
 		MacAddress dstMac = eth.getDestinationMACAddress();
 	
-		// Ignore reserved multicast/broadcast addresses
-		if (dstMac.isBroadcast() || dstMac.isMulticast()) {
-			log.info("Ignoring broadcast/multicast packet to MAC: {}", dstMac);
-			return Command.STOP;
-		}
-	
-		// Learning switch behavior: add source MAC and incoming port to MAC-to-Port map
+		// MAC-port learning
 		addToPortMap(sw, srcMac, inPort);
-	
-		// Get the output port for the destination MAC from the MAC table
+		
+		// Get the output port for the destination MAC
 		OFPort outPort = getFromPortMap(sw, dstMac);
 	
-		// Process IPv4 packets (e.g., for connection limits and TCP flow tracking)
-		if (eth.getEtherType() == EthType.IPv4) {
-			IPv4 ipv4Packet = (IPv4) eth.getPayload();
-			IPv4Address srcIp = ipv4Packet.getSourceAddress();
-			IPv4Address dstIp = ipv4Packet.getDestinationAddress();
-	
-			// Check connection limit for source IP
-			if (isConnectionLimited(srcIp) && !canConnect(srcIp, dstIp)) {
-				installDropRule(sw, srcIp, dstIp); // Block new connections if limit exceeded
-				return Command.STOP;
-			}
-	
-			// Add the connection to the active connections map
-			addToConnectionsMap(srcIp, dstIp);
-	
-			// Process TCP-specific flows
-			if (ipv4Packet.getProtocol() == IpProtocol.TCP) {
-				TCP tcpPacket = (TCP) ipv4Packet.getPayload();
-				installTcpFlowRule(sw, srcIp, dstIp, tcpPacket.getSourcePort(), tcpPacket.getDestinationPort());
-				addToTcpConnectionsMap(srcIp, dstIp); // Track the TCP connection
-			}
-		}
-	
-		// Handle unknown destination MAC address: flood packet if outPort is not found
+		// If destination port is unknown => broadcast/flood
 		if (outPort == null) {
 			log.info("Flooding packet as destination MAC {} is unknown on switch {}", dstMac, sw.getId());
 			SwitchCommands.sendPacketOutPacketIn(sw, OFPort.FLOOD, pi);
 			return Command.CONTINUE;
 		}
+
+		// Check connection limit for source IP
+		if (isConnectionLimited(srcMac) && !canConnect(sw, srcMac, dstMac)) {
+			installDropRule(sw, srcMac, dstMac); // Block new connections if limit exceeded
+			return Command.STOP;
+		}
+
+		// Check if ethernet frame is IP
+		if (eth.getEtherType() == EthType.IPv4) {
+			IPv4 ipv4Packet = (IPv4) eth.getPayload();
+
+			// Process TCP-specific flows
+			if (ipv4Packet.getProtocol() == IpProtocol.TCP) {
+				IPv4Address srcIp = ipv4Packet.getSourceAddress();
+				IPv4Address dstIp = ipv4Packet.getDestinationAddress();
+
+				TCP tcpPacket = (TCP) ipv4Packet.getPayload();
+				installTcpFlowRule(sw, srcIp, dstIp, tcpPacket.getSourcePort(), tcpPacket.getDestinationPort());  // Install TCP flow rule
+				
+				// FIXME: REMOVE????
+				addToTcpConnectionsMap(srcIp, dstIp); // Track the TCP connection
+			}
+		}
 	
-		// Forward packet to the learned destination port if it’s known
+		// Forward packet to the proper destination
 		if (!outPort.equals(inPort)) {
 			log.info("Forwarding packet to port {} for destination MAC {}", outPort, dstMac);
-			installFlow(sw, srcMac, dstMac, inPort, outPort);  // Install forward flow
-	
+			
+			log.info("ADD TO HOST CONNECTIONS MAP");
+			// Track new host-connection
+			addToHostConnectionsMap(sw, srcMac);
+			log.info("INSTALLING FLOW RULE");
+			// Install forward flow
+			installFlow(sw, srcMac, dstMac, inPort, outPort);  
+			log.info("INSTALLING REVERSE FLOW RULE");
 			// Install reverse flow for bidirectional communication
-			installReverseFlow(sw, dstMac, srcMac, outPort, inPort);
+			installReverseFlow(sw, srcMac, dstMac, inPort, outPort);  
 	
 			// Forward the packet directly
 			SwitchCommands.sendPacketOutPacketIn(sw, outPort, pi);
@@ -481,9 +519,9 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 		floodlightProviderService = context.getServiceImpl(IFloodlightProviderService.class);
 		this.switchService = context.getServiceImpl(IOFSwitchService.class);
 
-		hostMaxConnectionsMap = new ConcurrentHashMap<IPv4Address, Integer>();
-		hostConnectionsMap = new ConcurrentHashMap<IPv4Address, Set<IPv4Address>>();
-		tcpHostConnectionsMap = new ConcurrentHashMap<IPv4Address, Set<IPv4Address>>();
+		hostMaxConnectionsMap = new ConcurrentHashMap<MacAddress, Integer>();
+		hostConnectionsMap = new ConcurrentHashMap<IOFSwitch, Map<MacAddress, Integer>>();
+		tcpHostConnectionsMap = new ConcurrentHashMap<MacAddress, Set<MacAddress>>();
 		
 		try {
             tcpFlowStatsWriter = new FileWriter("tcp_flow_stats.csv");
