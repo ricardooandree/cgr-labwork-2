@@ -40,6 +40,7 @@ import org.projectfloodlight.openflow.types.OFBufferId;
 import org.projectfloodlight.openflow.types.OFPort;
 import org.projectfloodlight.openflow.types.OFVlanVidMatch;
 import org.projectfloodlight.openflow.types.TableId;
+import org.projectfloodlight.openflow.types.TransportPort;
 import org.projectfloodlight.openflow.types.U64;
 import org.projectfloodlight.openflow.types.VlanVid;
 import org.projectfloodlight.openflow.util.LRULinkedHashMap;
@@ -74,12 +75,8 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 
 	// Stores the learned state for each switch
 	protected Map<IOFSwitch, Map<MacAddress, OFPort>> macToSwitchPortMap;
-
 	protected Map<IOFSwitch, Map<MacAddress, Integer>> hostConnectionsMap;  // key = host MAC Address / value = number of active connections
 	protected Map<MacAddress, Integer> hostMaxConnectionsMap;				// key = host MAC Address / value = host connections limit
-
-
-	protected Map<MacAddress, Set<MacAddress>> tcpHostConnectionsMap;		// Maps host TCP connections
 	private FileWriter tcpFlowStatsWriter;									// File writer object
 	
 	// flow-mod - for use in the cookie
@@ -128,6 +125,24 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 		hostConnectionsMapValue.put(srcMac, hostConnectionsMapValue.getOrDefault(srcMac, 0) + 1);
 	}
 
+	// Updates the amount of active host connections on the map
+	private void updateHostConnextionsMap(IOFSwitch sw, MacAddress srcMac){
+			Map<MacAddress, Integer> hostConnectionsMapValue = hostConnectionsMap.get(sw);
+
+			if (hostConnectionsMapValue != null && hostConnectionsMapValue.containsKey(srcMac)) {
+				int connections = hostConnectionsMapValue.get(srcMac);
+				
+				if (connections > 1) {
+					hostConnectionsMapValue.put(srcMac, connections - 1);
+				} else {
+					hostConnectionsMapValue.remove(srcMac); // No active connections left for this MAC - remove it from the hostConnectionsMap
+				}
+			}
+	}
+
+
+
+	// Install rule methods
 	private void installDropRule(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac) {
         Match match = sw.getOFFactory().buildMatch()
                 .setExact(MatchField.ETH_SRC, srcMac)
@@ -144,11 +159,11 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
         List<OFInstruction> instructionList = new ArrayList<>();
         instructionList.add(applyActions);
 
-        // Install drop rule
-        boolean ruleCheck = SwitchCommands.installRule(sw, TableId.of(0), (short) FLOWMOD_PRIORITY, 
+        // Install drop rule - NOTE: Higher priority than other rules
+        boolean ruleCheck = SwitchCommands.installRule(sw, TableId.of(0), (short) (FLOWMOD_PRIORITY + 50), 
                                    match, instructionList, null, 
                                    FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT, 
-                                   OFBufferId.NO_BUFFER, true);
+                                   OFBufferId.NO_BUFFER, false);
 
 		
 		if (ruleCheck){
@@ -223,32 +238,52 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
     }
 
     private void installTcpFlowRule(IOFSwitch sw, IPv4Address srcIp, IPv4Address dstIp, TransportPort srcPort, TransportPort dstPort) {
-        Match match = sw.getOFFactory().buildMatch()
-                .setExact(MatchField.IPV4_SRC, srcIp)
-                .setExact(MatchField.IPV4_DST, dstIp)
-                .setExact(MatchField.TCP_SRC, srcPort)
-                .setExact(MatchField.TCP_DST, dstPort)
-                .build();
+		Match match = sw.getOFFactory().buildMatch()
+				.setExact(MatchField.IPV4_SRC, srcIp)         // Match source IP
+				.setExact(MatchField.IPV4_DST, dstIp)         // Match destination IP
+				.setExact(MatchField.TCP_SRC, srcPort)        // Match TCP source port
+				.setExact(MatchField.TCP_DST, dstPort)        // Match TCP destination port
+				.build();
+	
+		OFActionOutput outputAction = sw.getOFFactory().actions().buildOutput()
+				.setPort(OFPort.NORMAL)          // Forward to default path - triggers other rules 
+				.setMaxLen(Integer.MAX_VALUE) 
+				.build();
+	
+		List<OFAction> actions = new ArrayList<>();
+		actions.add(outputAction);
+	
+		OFInstructionApplyActions applyActions = sw.getOFFactory().instructions().buildApplyActions()
+				.setActions(actions)
+				.build();
 
-        List<OFAction> actions = Arrays.asList(
-                sw.getOFFactory().actions().buildOutput().setPort(OFPort.CONTROLLER).setMaxLen(Integer.MAX_VALUE).build()
-        );
+		List<OFInstruction> instructions = new ArrayList<>();
+		instructions.add(applyActions);
 
-        SwitchCommands.installRule(sw, TableId.of(0), (short) (FLOWMOD_PRIORITY + 100), match, null, actions, 
-                                   FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT, OFBufferId.NO_BUFFER, true);
+		// Install the TCP flow rule 
+		boolean ruleCheck = SwitchCommands.installRule(sw, TableId.of(0), (short) FLOWMOD_PRIORITY,
+									match, instructions, null, 
+									FLOWMOD_DEFAULT_HARD_TIMEOUT, FLOWMOD_DEFAULT_IDLE_TIMEOUT,
+									OFBufferId.NO_BUFFER, true);
+	
+		if (ruleCheck){
+			log.info("TCP flow rule installed");
+		}
+	}
 
-        addToTcpConnectionsMap(srcIp, dstIp);
-    }
+    private void logFlowDetails(OFFlowRemoved flowRemovedMessage, IPv4Address srcIp, IPv4Address dstIp, TransportPort srcPort, TransportPort dstPort) {
+		try {
+			tcpFlowStatsWriter.write(String.format("%s,%s,%s,%s,%d,%d%n", 
+												srcIp, dstIp, srcPort, dstPort, 
+												flowRemovedMessage.getByteCount().getValue(), 
+												flowRemovedMessage.getDurationSec()));
+			tcpFlowStatsWriter.flush(); // Ensure the data is written immediately
+		} catch (IOException e) {
+			log.error("Failed to log TCP flow statistics", e);
+		}
 
-    private void logFlowDetails(OFFlowRemoved flowRemovedMessage, IPv4Address srcIp, IPv4Address dstIp) {
-        try {
-            tcpFlowStatsWriter.write(String.format("%s, %s, %d, %d\n", srcIp, dstIp,
-                    flowRemovedMessage.getByteCount().getValue(), flowRemovedMessage.getDurationSec()));
-            tcpFlowStatsWriter.flush();
-        } catch (IOException e) {
-            log.error("Failed to write TCP flow data", e);
-        }
-    }
+		log.info("TCP Flow Removed");
+	}
 
 
 
@@ -389,9 +424,6 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 
 				TCP tcpPacket = (TCP) ipv4Packet.getPayload();
 				installTcpFlowRule(sw, srcIp, dstIp, tcpPacket.getSourcePort(), tcpPacket.getDestinationPort());  // Install TCP flow rule
-				
-				// FIXME: REMOVE????
-				addToTcpConnectionsMap(srcIp, dstIp); // Track the TCP connection
 			}
 		}
 	
@@ -427,31 +459,43 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 	 * @return Whether to continue processing this message or stop.
 	 */
 	private Command processFlowRemovedMessage(IOFSwitch sw, OFFlowRemoved flowRemovedMessage) {
+		// Extract match fields from the flowRemovedMessage
 		Match match = flowRemovedMessage.getMatch();
 		IPv4Address srcIp = match.get(MatchField.IPV4_SRC);
-        IPv4Address dstIp = match.get(MatchField.IPV4_DST);
-
-        if (tcpHostConnectionsMap.containsKey(srcIp)) {
-            logFlowDetails(flowRemovedMessage, srcIp, dstIp); // Log TCP-specific flows
-            removeFromTcpConnectionsMap(srcIp, dstIp); // Remove from active TCP connections
-        }
-
-		// Update host connection map if the flow has expired
-		removeFromConnectionsMap(srcIp, dstIp);
-		
-		// When a flow entry expires, it means the device with the matching source
-		// MAC address either stopped sending packets or moved to a different
-		// port.  If the device moved, we can't know where it went until it sends
-		// another packet, allowing us to re-learn its port.  Meanwhile we remove
-		// it from the macToPortMap to revert to flooding packets to this device.
-		
-		// Also, if packets keep coming from another device (e.g. from ping), the
-		// corresponding reverse flow entry will never expire on its own and will
-		// send the packets to the wrong port (the matching input port of the
-		// expired flow entry), so we must delete the reverse entry explicitly.
-		
+		IPv4Address dstIp = match.get(MatchField.IPV4_DST);
+		TransportPort srcPort = match.get(MatchField.TCP_SRC);
+	    TransportPort dstPort = match.get(MatchField.TCP_DST);
+		MacAddress srcMac = match.get(MatchField.ETH_SRC);
+		MacAddress dstMac = match.get(MatchField.ETH_DST);
+	
+		// Log TCP-specific flow statistics if applicable
+		if (srcIp != null && dstIp != null && match.isExact(MatchField.TCP_SRC)) {
+			logFlowDetails(flowRemovedMessage, srcIp, dstIp, srcPort, dstPort);
+		}
+	
+		// Update hostConnectionsMap to decrement connection count for the source MAC
+		if (srcMac != null && hostConnectionsMap.containsKey(sw)) {
+			updateHostConnectionsMap(sw, srcMac);
+		}
+	
+		// Remove the MAC-to-Port mapping for the source MAC to revert to flooding
+		if (srcMac != null) {
+			removeFromPortMap(sw, srcMac);
+		}
+	
+		// Clean up reverse flow if applicable
+		if (srcMac != null && dstMac != null) {
+			Match reverseMatch = sw.getOFFactory().buildMatch()
+					.setExact(MatchField.ETH_SRC, dstMac)
+					.setExact(MatchField.ETH_DST, srcMac)
+					.build();
+	
+			SwitchCommands.removeRules(sw, TableId.of(0), reverseMatch);
+			log.info("Removed reverse flow for srcMAC={}, dstMAC={}", dstMac, srcMac);
+		}
+	
 		return Command.CONTINUE;
-	}
+	}	
 
 	// IOFMessageListener
 	@Override
@@ -459,20 +503,14 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 		switch (msg.getType()) {
 		case PACKET_IN:
 			return this.processPacketInMessage(sw, (OFPacketIn) msg, cntx);
+
 		case FLOW_REMOVED:
-			//return this.processFlowRemovedMessage(sw, (OFFlowRemoved) msg);
-			OFFlowRemoved flowRemoved = (OFFlowRemoved) msg;
-			Match match = flowRemoved.getMatch();
-			IPv4Address srcIp = match.get(MatchField.IPV4_SRC);
-			IPv4Address dstIp = match.get(MatchField.IPV4_DST);
-			if (tcpHostConnectionsMap.containsKey(srcIp)) {
-				logFlowDetails(flowRemoved, srcIp, dstIp);
-				removeFromTcpConnectionsMap(srcIp, dstIp);
-			}
-			return Command.CONTINUE;
+			return this.processFlowRemovedMessage(sw, (OFFlowRemoved) msg);
+
 		case ERROR:
 			log.info("received an error {} from switch {}", msg, sw);
 			return Command.CONTINUE;
+
 		default:
 			log.error("received an unexpected message {} from switch {}", msg, sw);
 			return Command.CONTINUE;
@@ -521,10 +559,9 @@ public class CGRmodule implements IFloodlightModule, IOFMessageListener, IOFSwit
 
 		hostMaxConnectionsMap = new ConcurrentHashMap<MacAddress, Integer>();
 		hostConnectionsMap = new ConcurrentHashMap<IOFSwitch, Map<MacAddress, Integer>>();
-		tcpHostConnectionsMap = new ConcurrentHashMap<MacAddress, Set<MacAddress>>();
 		
 		try {
-            tcpFlowStatsWriter = new FileWriter("tcp_flow_stats.csv");
+            tcpFlowStatsWriter = new FileWriter("/home/pfa/Desktop/tcp_flow_stats.csv");
             tcpFlowStatsWriter.write("SourceIP, DestinationIP, SourcePort, DestinationPort, ByteCount, Duration\n");
 
         } catch (IOException e) {
